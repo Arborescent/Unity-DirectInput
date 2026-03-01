@@ -840,12 +840,13 @@ FlatJoyState2 FlattenDIJOYSTATE2(DIJOYSTATE2 DeviceState) {
   state.lFRy = DeviceState.lFRy; // Y-axis torque
   state.lFRz = DeviceState.lFRz; // Z-axis torque
 
-  for (int i = 0; i < 4; i++) { // In banks of 4, shift in the sate of each DPAD 0-16 bits 
+  for (int i = 0; i < 4; i++) { // 4 bits per DPAD: up/down/left/right packed into 16-bit short
+    int base = i * 4; // Each DPAD gets a 4-bit slot
     switch (DeviceState.rgdwPOV[i]) {
-    case 0:     state.rgdwPOV |= (byte)(1 << ((i + 1) * 0)); break; // dpad[i]/up, bit = 0     shift into value at stride (i+1) * DPADButton
-    case 18000: state.rgdwPOV |= (byte)(1 << ((i + 1) * 1)); break; // dpad[i]/down, bit = 1
-    case 27000: state.rgdwPOV |= (byte)(1 << ((i + 1) * 2)); break; // dpad[i]/left, bit = 2
-    case 9000:  state.rgdwPOV |= (byte)(1 << ((i + 1) * 3)); break; // dpad[i]/right, bit = 3
+    case 0:     state.rgdwPOV |= (1 << (base + 0)); break; // up
+    case 9000:  state.rgdwPOV |= (1 << (base + 1)); break; // right
+    case 18000: state.rgdwPOV |= (1 << (base + 2)); break; // down
+    case 27000: state.rgdwPOV |= (1 << (base + 3)); break; // left
     }
   }
 
