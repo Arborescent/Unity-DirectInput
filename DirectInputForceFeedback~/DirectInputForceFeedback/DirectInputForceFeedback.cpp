@@ -16,43 +16,58 @@ DeviceChangeCallback _DeviceChangeCallback; // External function to invoke on de
 std::vector<std::wstring> DEBUGDATA; // Used for Debugging during development
 
 //////////////////////////////////////////////////////////////
-// SEH-safe wrappers for DirectInput COM calls
-// These functions contain no C++ objects with destructors,
-// making them safe to use with __try/__except.
-// Wine/Proton may crash in DirectInput FFB operations;
-// these wrappers convert access violations into HRESULT errors.
+// Crash recovery for DirectInput FFB operations.
+// Wine/Proton does not properly support SEH (__try/__except),
+// so we use a Vectored Exception Handler with setjmp/longjmp
+// to catch access violations in DirectInput COM calls.
+// After any FFB crash, FFB is disabled for that device.
 //////////////////////////////////////////////////////////////
 
-static HRESULT SafeCreateEffect(LPDIRECTINPUTDEVICE8 device, REFGUID effectGuid, LPDIEFFECT effect, LPDIRECTINPUTEFFECT* pEffect) {
-  __try {
-    return device->CreateEffect(effectGuid, effect, pEffect, nullptr);
-  } __except(EXCEPTION_EXECUTE_HANDLER) {
-    return E_FAIL;
+#include <setjmp.h>
+
+static thread_local jmp_buf _ffb_jmpbuf;
+static thread_local volatile bool _ffb_guarded = false;
+static PVOID _vecExceptionHandler = nullptr;
+static std::map<DeviceGUID, bool> _ffbDisabled; // Devices where FFB has crashed
+
+LONG CALLBACK _FFBExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo) {
+  if (_ffb_guarded) {
+    _ffb_guarded = false;
+    longjmp(_ffb_jmpbuf, 1);
   }
+  return EXCEPTION_CONTINUE_SEARCH;
 }
 
-static HRESULT SafeStartEffect(LPDIRECTINPUTEFFECT effect) {
-  __try {
-    return effect->Start(1, 0);
-  } __except(EXCEPTION_EXECUTE_HANDLER) {
-    return E_FAIL;
-  }
+static __declspec(noinline) HRESULT SafeCreateEffect(LPDIRECTINPUTDEVICE8 device, REFGUID effectGuid, LPDIEFFECT effect, LPDIRECTINPUTEFFECT* pEffect) {
+  _ffb_guarded = true;
+  if (setjmp(_ffb_jmpbuf) != 0) { return E_FAIL; }
+  HRESULT hr = device->CreateEffect(effectGuid, effect, pEffect, nullptr);
+  _ffb_guarded = false;
+  return hr;
 }
 
-static HRESULT SafeStopEffect(LPDIRECTINPUTEFFECT effect) {
-  __try {
-    return effect->Stop();
-  } __except(EXCEPTION_EXECUTE_HANDLER) {
-    return E_FAIL;
-  }
+static __declspec(noinline) HRESULT SafeStartEffect(LPDIRECTINPUTEFFECT effect) {
+  _ffb_guarded = true;
+  if (setjmp(_ffb_jmpbuf) != 0) { return E_FAIL; }
+  HRESULT hr = effect->Start(1, 0);
+  _ffb_guarded = false;
+  return hr;
 }
 
-static HRESULT SafeSetParameters(LPDIRECTINPUTEFFECT effect, LPDIEFFECT params, DWORD flags) {
-  __try {
-    return effect->SetParameters(params, flags);
-  } __except(EXCEPTION_EXECUTE_HANDLER) {
-    return E_FAIL;
-  }
+static __declspec(noinline) HRESULT SafeStopEffect(LPDIRECTINPUTEFFECT effect) {
+  _ffb_guarded = true;
+  if (setjmp(_ffb_jmpbuf) != 0) { return E_FAIL; }
+  HRESULT hr = effect->Stop();
+  _ffb_guarded = false;
+  return hr;
+}
+
+static __declspec(noinline) HRESULT SafeSetParameters(LPDIRECTINPUTEFFECT effect, LPDIEFFECT params, DWORD flags) {
+  _ffb_guarded = true;
+  if (setjmp(_ffb_jmpbuf) != 0) { return E_FAIL; }
+  HRESULT hr = effect->SetParameters(params, flags);
+  _ffb_guarded = false;
+  return hr;
 }
 
 //////////////////////////////////////////////////////////////
@@ -62,6 +77,11 @@ static HRESULT SafeSetParameters(LPDIRECTINPUTEFFECT effect, LPDIEFFECT params, 
 // Create the _DirectInput global
 HRESULT StartDirectInput() {
   if (_DirectInput != NULL) { return S_OK; } // Already initialised
+
+  // Setup crash recovery for FFB operations (works under Wine/Proton unlike SEH)
+  if (_vecExceptionHandler == nullptr) {
+    _vecExceptionHandler = AddVectoredExceptionHandler(1, _FFBExceptionHandler);
+  }
 
   // Setup Device Change Detection (Add/Remove Device Events)
   SetWindowsHookExW(WH_CALLWNDPROC, (HOOKPROC)&_WindowsHookCallback, GetModuleHandleW(NULL), GetCurrentThreadId());
@@ -91,6 +111,9 @@ HRESULT StopDirectInput() {
   _DeviceFFBAxes.clear();
   _DeviceFFBEffectConfig.clear();
   _DeviceFFBEffectControl.clear();
+  _ffbDisabled.clear();
+
+  if (_vecExceptionHandler) { RemoveVectoredExceptionHandler(_vecExceptionHandler); _vecExceptionHandler = nullptr; }
 
   _DirectInput = NULL;
 
@@ -310,6 +333,7 @@ HRESULT EnumerateFFBAxes(LPCSTR guidInstance, /*[out]*/ SAFEARRAY** FFBAxes) {
 HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
   HRESULT hr = E_FAIL;
   std::string GUIDString((LPCSTR)guidInstance); if (!_ActiveDevices.contains(GUIDString)) return hr; // Device not attached, fail
+  if (_ffbDisabled[GUIDString]) return E_FAIL; // FFB crashed previously on this device
 
   if (_DeviceFFBEffectControl[GUIDString].contains(effectType)) { return E_ABORT; } // Effect Already Exists on Device
   
@@ -391,8 +415,8 @@ HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
   }
 
   LPDIRECTINPUTEFFECT effectControl;
-  if (FAILED(hr = SafeCreateEffect(_ActiveDevices[GUIDString], EffectTypeToGUID(effectType), &effect, &effectControl))) { return hr; }
-  if (FAILED(hr = SafeStartEffect(effectControl))) { return hr; }
+  if (FAILED(hr = SafeCreateEffect(_ActiveDevices[GUIDString], EffectTypeToGUID(effectType), &effect, &effectControl))) { _ffbDisabled[GUIDString] = true; return hr; }
+  if (FAILED(hr = SafeStartEffect(effectControl))) { _ffbDisabled[GUIDString] = true; return hr; }
   _DeviceFFBEffectConfig[GUIDString][effectType]  = effect;
   _DeviceFFBEffectControl[GUIDString][effectType] = effectControl;
 
@@ -416,6 +440,7 @@ HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
 HRESULT UpdateFFBEffect(LPCSTR guidInstance, Effects::Type effectType, DICONDITION* conditions) {
   HRESULT hr = E_FAIL;
   std::string GUIDString((LPCSTR)guidInstance); if (!_ActiveDevices.contains(GUIDString)) return hr; // Device not attached, fail
+  if (_ffbDisabled[GUIDString]) return E_FAIL; // FFB crashed previously on this device
   if (!_DeviceFFBEffectControl[GUIDString].contains(effectType)) { return E_ABORT; } // Effect doesn't exist
   if (conditions == nullptr) { return E_POINTER; } // No conditions provided
   if (_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams == nullptr) { return E_POINTER; } // Effect params not allocated
@@ -440,6 +465,7 @@ HRESULT UpdateFFBEffect(LPCSTR guidInstance, Effects::Type effectType, DICONDITI
   }
 
   hr = SafeSetParameters(_DeviceFFBEffectControl[GUIDString][effectType], &_DeviceFFBEffectConfig[GUIDString][effectType], DIEP_TYPESPECIFICPARAMS);
+  if (FAILED(hr)) { _ffbDisabled[GUIDString] = true; }
   return hr;
 }
 
