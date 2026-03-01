@@ -29,6 +29,32 @@ static thread_local jmp_buf _ffb_jmpbuf;
 static thread_local volatile bool _ffb_guarded = false;
 static PVOID _vecExceptionHandler = nullptr;
 
+//////////////////////////////////////////////////////////////
+// FFB update throttle.
+// Limits how often SetParameters is sent to the device to
+// prevent the USB HID command queue from filling up, which
+// causes latency and FFB oscillation.
+//////////////////////////////////////////////////////////////
+
+static const LONGLONG FFB_MIN_INTERVAL_US = 5000; // 5ms = 200Hz max update rate
+static std::map<DeviceGUID, std::map<Effects::Type, LARGE_INTEGER>> _ffbLastUpdate;
+static LARGE_INTEGER _qpcFrequency = {};
+
+static bool ShouldThrottleFFB(const std::string& guid, Effects::Type effectType) {
+  if (_qpcFrequency.QuadPart == 0) {
+    QueryPerformanceFrequency(&_qpcFrequency);
+  }
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  LARGE_INTEGER& last = _ffbLastUpdate[guid][effectType];
+  LONGLONG elapsed = ((now.QuadPart - last.QuadPart) * 1000000) / _qpcFrequency.QuadPart;
+  if (elapsed < FFB_MIN_INTERVAL_US) {
+    return true; // Too soon, skip this update
+  }
+  last = now;
+  return false;
+}
+
 LONG CALLBACK _FFBExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo) {
   if (_ffb_guarded) {
     _ffb_guarded = false;
@@ -110,6 +136,7 @@ HRESULT StopDirectInput() {
   _DeviceFFBAxes.clear();
   _DeviceFFBEffectConfig.clear();
   _DeviceFFBEffectControl.clear();
+  _ffbLastUpdate.clear();
   if (_vecExceptionHandler) { RemoveVectoredExceptionHandler(_vecExceptionHandler); _vecExceptionHandler = nullptr; }
 
   _DirectInput = NULL;
@@ -460,6 +487,8 @@ HRESULT UpdateFFBEffect(LPCSTR guidInstance, Effects::Type effectType, DICONDITI
       }
       break;
   }
+
+  if (ShouldThrottleFFB(GUIDString, effectType)) { return S_OK; } // Skip stale updates to prevent queue buildup
 
   hr = SafeSetParameters(_DeviceFFBEffectControl[GUIDString][effectType], &_DeviceFFBEffectConfig[GUIDString][effectType], DIEP_TYPESPECIFICPARAMS);
   return hr;
