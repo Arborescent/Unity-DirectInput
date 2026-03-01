@@ -28,7 +28,6 @@ std::vector<std::wstring> DEBUGDATA; // Used for Debugging during development
 static thread_local jmp_buf _ffb_jmpbuf;
 static thread_local volatile bool _ffb_guarded = false;
 static PVOID _vecExceptionHandler = nullptr;
-static std::map<DeviceGUID, bool> _ffbDisabled; // Devices where FFB has crashed
 
 LONG CALLBACK _FFBExceptionHandler(PEXCEPTION_POINTERS pExceptionInfo) {
   if (_ffb_guarded) {
@@ -111,8 +110,6 @@ HRESULT StopDirectInput() {
   _DeviceFFBAxes.clear();
   _DeviceFFBEffectConfig.clear();
   _DeviceFFBEffectControl.clear();
-  _ffbDisabled.clear();
-
   if (_vecExceptionHandler) { RemoveVectoredExceptionHandler(_vecExceptionHandler); _vecExceptionHandler = nullptr; }
 
   _DirectInput = NULL;
@@ -333,7 +330,6 @@ HRESULT EnumerateFFBAxes(LPCSTR guidInstance, /*[out]*/ SAFEARRAY** FFBAxes) {
 HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
   HRESULT hr = E_FAIL;
   std::string GUIDString((LPCSTR)guidInstance); if (!_ActiveDevices.contains(GUIDString)) return hr; // Device not attached, fail
-  if (_ffbDisabled[GUIDString]) return E_FAIL; // FFB crashed previously on this device
 
   if (_DeviceFFBEffectControl[GUIDString].contains(effectType)) { return E_ABORT; } // Effect Already Exists on Device
   
@@ -415,8 +411,8 @@ HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
   }
 
   LPDIRECTINPUTEFFECT effectControl;
-  if (FAILED(hr = SafeCreateEffect(_ActiveDevices[GUIDString], EffectTypeToGUID(effectType), &effect, &effectControl))) { _ffbDisabled[GUIDString] = true; return hr; }
-  if (FAILED(hr = SafeStartEffect(effectControl))) { _ffbDisabled[GUIDString] = true; return hr; }
+  if (FAILED(hr = SafeCreateEffect(_ActiveDevices[GUIDString], EffectTypeToGUID(effectType), &effect, &effectControl))) { return hr; }
+  if (FAILED(hr = SafeStartEffect(effectControl))) { return hr; }
   _DeviceFFBEffectConfig[GUIDString][effectType]  = effect;
   _DeviceFFBEffectControl[GUIDString][effectType] = effectControl;
 
@@ -440,7 +436,6 @@ HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
 HRESULT UpdateFFBEffect(LPCSTR guidInstance, Effects::Type effectType, DICONDITION* conditions) {
   HRESULT hr = E_FAIL;
   std::string GUIDString((LPCSTR)guidInstance); if (!_ActiveDevices.contains(GUIDString)) return hr; // Device not attached, fail
-  if (_ffbDisabled[GUIDString]) return E_FAIL; // FFB crashed previously on this device
   if (!_DeviceFFBEffectControl[GUIDString].contains(effectType)) { return E_ABORT; } // Effect doesn't exist
   if (conditions == nullptr) { return E_POINTER; } // No conditions provided
   if (_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams == nullptr) { return E_POINTER; } // Effect params not allocated
@@ -467,7 +462,6 @@ HRESULT UpdateFFBEffect(LPCSTR guidInstance, Effects::Type effectType, DICONDITI
   }
 
   hr = SafeSetParameters(_DeviceFFBEffectControl[GUIDString][effectType], &_DeviceFFBEffectConfig[GUIDString][effectType], DIEP_TYPESPECIFICPARAMS);
-  if (FAILED(hr)) { _ffbDisabled[GUIDString] = true; }
   return hr;
 }
 
