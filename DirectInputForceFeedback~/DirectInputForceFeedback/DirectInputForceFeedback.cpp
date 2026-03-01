@@ -16,6 +16,46 @@ DeviceChangeCallback _DeviceChangeCallback; // External function to invoke on de
 std::vector<std::wstring> DEBUGDATA; // Used for Debugging during development
 
 //////////////////////////////////////////////////////////////
+// SEH-safe wrappers for DirectInput COM calls
+// These functions contain no C++ objects with destructors,
+// making them safe to use with __try/__except.
+// Wine/Proton may crash in DirectInput FFB operations;
+// these wrappers convert access violations into HRESULT errors.
+//////////////////////////////////////////////////////////////
+
+static HRESULT SafeCreateEffect(LPDIRECTINPUTDEVICE8 device, REFGUID effectGuid, LPDIEFFECT effect, LPDIRECTINPUTEFFECT* pEffect) {
+  __try {
+    return device->CreateEffect(effectGuid, effect, pEffect, nullptr);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+static HRESULT SafeStartEffect(LPDIRECTINPUTEFFECT effect) {
+  __try {
+    return effect->Start(1, 0);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+static HRESULT SafeStopEffect(LPDIRECTINPUTEFFECT effect) {
+  __try {
+    return effect->Stop();
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+static HRESULT SafeSetParameters(LPDIRECTINPUTEFFECT effect, LPDIEFFECT params, DWORD flags) {
+  __try {
+    return effect->SetParameters(params, flags);
+  } __except(EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+//////////////////////////////////////////////////////////////
 // DLL Exported Functions
 //////////////////////////////////////////////////////////////
 
@@ -351,8 +391,8 @@ HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
   }
 
   LPDIRECTINPUTEFFECT effectControl;
-  if (FAILED(hr = _ActiveDevices[GUIDString]->CreateEffect(EffectTypeToGUID(effectType), &effect, &effectControl, nullptr))) { return hr; }
-  if (FAILED(hr = effectControl->Start(1, 0))) { return hr; }
+  if (FAILED(hr = SafeCreateEffect(_ActiveDevices[GUIDString], EffectTypeToGUID(effectType), &effect, &effectControl))) { return hr; }
+  if (FAILED(hr = SafeStartEffect(effectControl))) { return hr; }
   _DeviceFFBEffectConfig[GUIDString][effectType]  = effect;
   _DeviceFFBEffectControl[GUIDString][effectType] = effectControl;
 
@@ -366,7 +406,7 @@ HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
   // Destroy Effect
   if (!_DeviceFFBEffectControl[GUIDString].contains(effectType)) { return S_OK; } // Effect doesn't exist
 
-  hr = _DeviceFFBEffectControl[GUIDString][effectType]->Stop(); // Stop Effect
+  hr = SafeStopEffect(_DeviceFFBEffectControl[GUIDString][effectType]); // Stop Effect
   _DeviceFFBEffectControl[GUIDString].erase(effectType);        // Remove Effect Control
   _DeviceFFBEffectConfig[GUIDString].erase(effectType);         // Remove Effect Config
 
@@ -377,26 +417,29 @@ HRESULT UpdateFFBEffect(LPCSTR guidInstance, Effects::Type effectType, DICONDITI
   HRESULT hr = E_FAIL;
   std::string GUIDString((LPCSTR)guidInstance); if (!_ActiveDevices.contains(GUIDString)) return hr; // Device not attached, fail
   if (!_DeviceFFBEffectControl[GUIDString].contains(effectType)) { return E_ABORT; } // Effect doesn't exist
+  if (conditions == nullptr) { return E_POINTER; } // No conditions provided
+  if (_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams == nullptr) { return E_POINTER; } // Effect params not allocated
 
-  for (int idx = 0; idx < _DeviceFFBEffectConfig[GUIDString][effectType].cAxes; idx++) { // For each Axis in this effect
-    switch (effectType) {
-      case Effects::Type::ConstantForce: {
-        // Modify the heap-allocated DICONSTANTFORCE in-place (do NOT use a stack copy)
-        DICONSTANTFORCE* pCF = reinterpret_cast<DICONSTANTFORCE*>(_DeviceFFBEffectConfig[GUIDString][Effects::Type::ConstantForce].lpvTypeSpecificParams);
-        pCF->lMagnitude = conditions[idx].lPositiveCoefficient;
-        break;
-      }
-      default:
-        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lOffset = conditions->lOffset;
+  switch (effectType) {
+    case Effects::Type::ConstantForce: {
+      // ConstantForce is a single struct, not per-axis - don't loop over cAxes
+      DICONSTANTFORCE* pCF = reinterpret_cast<DICONSTANTFORCE*>(_DeviceFFBEffectConfig[GUIDString][Effects::Type::ConstantForce].lpvTypeSpecificParams);
+      pCF->lMagnitude = conditions[0].lPositiveCoefficient;
+      break;
+    }
+    default:
+      for (DWORD idx = 0; idx < _DeviceFFBEffectConfig[GUIDString][effectType].cAxes; idx++) { // For each Axis in this effect
+        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lOffset = conditions[idx].lOffset;
         ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lPositiveCoefficient = conditions[idx].lPositiveCoefficient;
         ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lNegativeCoefficient = conditions[idx].lNegativeCoefficient;
         ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].dwPositiveSaturation = conditions[idx].dwPositiveSaturation;
         ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].dwNegativeSaturation = conditions[idx].dwNegativeSaturation;
         ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lDeadBand = conditions[idx].lDeadBand;
-        break;
-    }
+      }
+      break;
   }
-  hr = _DeviceFFBEffectControl[GUIDString][effectType]->SetParameters(&_DeviceFFBEffectConfig[GUIDString][effectType], DIEP_TYPESPECIFICPARAMS);
+
+  hr = SafeSetParameters(_DeviceFFBEffectControl[GUIDString][effectType], &_DeviceFFBEffectConfig[GUIDString][effectType], DIEP_TYPESPECIFICPARAMS);
   return hr;
 }
 
