@@ -97,7 +97,16 @@ HRESULT CreateDevice(LPCSTR guidInstance) {
   LPDIRECTINPUTDEVICE8 DIDevice;
   if (FAILED(hr = _DirectInput->CreateDevice(LPCSTRGUIDtoGUID(guidInstance), &DIDevice, NULL))) { return hr; }
   if (FAILED(hr = DIDevice->SetDataFormat(&c_dfDIJoystick2))) { return hr; }
-  if (FAILED(hr = DIDevice->SetCooperativeLevel(FindMainWindow(GetCurrentProcessId()), DISCL_EXCLUSIVE | DISCL_BACKGROUND))) { return hr; }
+
+  HWND hwnd = FindMainWindow(GetCurrentProcessId());
+  if (hwnd == NULL) { hwnd = GetDesktopWindow(); } // Fallback for Wine/Proton where FindMainWindow may fail
+
+  // Try exclusive mode first, fall back to nonexclusive (Wine/Proton may not support exclusive)
+  hr = DIDevice->SetCooperativeLevel(hwnd, DISCL_EXCLUSIVE | DISCL_BACKGROUND);
+  if (FAILED(hr)) {
+    if (FAILED(hr = DIDevice->SetCooperativeLevel(hwnd, DISCL_NONEXCLUSIVE | DISCL_BACKGROUND))) { return hr; }
+  }
+
   if (FAILED(hr = DIDevice->Acquire())) { return hr; }
 
   std::string GUIDString((LPCSTR)guidInstance); // Convert the LPCSTR to a STL String for use as key in map (String as GUID has no operater<)
@@ -125,7 +134,18 @@ HRESULT GetDeviceState(LPCSTR guidInstance, /*[out]*/ FlatJoyState2& deviceState
   std::string GUIDString((LPCSTR)guidInstance); if (!_ActiveDevices.contains(GUIDString)) return hr; // Device not attached, fail
 
   DIJOYSTATE2 DeviceStateRaw;
+  ZeroMemory(&DeviceStateRaw, sizeof(DIJOYSTATE2));
   hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &DeviceStateRaw); // Fetch the device State
+
+  if (FAILED(hr)) { // Device may have lost acquisition (common under Wine/Proton)
+    _ActiveDevices[GUIDString]->Acquire(); // Try to reacquire
+    hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &DeviceStateRaw); // Retry
+    if (FAILED(hr)) {
+      ZeroMemory(&deviceState, sizeof(FlatJoyState2));
+      return hr;
+    }
+  }
+
   deviceState = FlattenDIJOYSTATE2(DeviceStateRaw); // Convert to a friendlier format (Nested arrays are more difficult to check for change)
 
   return hr;
@@ -136,7 +156,13 @@ HRESULT GetDeviceStateRaw(LPCSTR guidInstance, /*[out]*/ DIJOYSTATE2& deviceStat
   HRESULT hr = E_FAIL;
   std::string GUIDString((LPCSTR)guidInstance); if (!_ActiveDevices.contains(GUIDString)) return hr; // Device not attached, fail
 
+  ZeroMemory(&deviceState, sizeof(DIJOYSTATE2));
   hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &deviceState); // Fetch the device State
+
+  if (FAILED(hr)) { // Device may have lost acquisition (common under Wine/Proton)
+    _ActiveDevices[GUIDString]->Acquire(); // Try to reacquire
+    hr = _ActiveDevices[GUIDString]->GetDeviceState(sizeof(DIJOYSTATE2), &deviceState); // Retry
+  }
 
   return hr;
 }
@@ -354,11 +380,12 @@ HRESULT UpdateFFBEffect(LPCSTR guidInstance, Effects::Type effectType, DICONDITI
 
   for (int idx = 0; idx < _DeviceFFBEffectConfig[GUIDString][effectType].cAxes; idx++) { // For each Axis in this effect
     switch (effectType) {
-      case Effects::Type::ConstantForce:
-        DICONSTANTFORCE CF = *reinterpret_cast<DICONSTANTFORCE*>(_DeviceFFBEffectConfig[GUIDString][Effects::Type::ConstantForce].lpvTypeSpecificParams);
-        CF.lMagnitude = conditions[idx].lPositiveCoefficient;
-        _DeviceFFBEffectConfig[GUIDString][Effects::Type::ConstantForce].lpvTypeSpecificParams = &CF;
+      case Effects::Type::ConstantForce: {
+        // Modify the heap-allocated DICONSTANTFORCE in-place (do NOT use a stack copy)
+        DICONSTANTFORCE* pCF = reinterpret_cast<DICONSTANTFORCE*>(_DeviceFFBEffectConfig[GUIDString][Effects::Type::ConstantForce].lpvTypeSpecificParams);
+        pCF->lMagnitude = conditions[idx].lPositiveCoefficient;
         break;
+      }
       default:
         ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lOffset = conditions->lOffset;
         ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lPositiveCoefficient = conditions[idx].lPositiveCoefficient;
