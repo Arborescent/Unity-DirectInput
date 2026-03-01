@@ -20,7 +20,6 @@ std::vector<std::wstring> DEBUGDATA; // Used for Debugging during development
 // Wine/Proton does not properly support SEH (__try/__except),
 // so we use a Vectored Exception Handler with setjmp/longjmp
 // to catch access violations in DirectInput COM calls.
-// After any FFB crash, FFB is disabled for that device.
 //////////////////////////////////////////////////////////////
 
 #include <setjmp.h>
@@ -126,10 +125,15 @@ HRESULT StopDirectInput() {
   if (_DirectInput == NULL) { return hr = S_OK; } // No DirectInput Instance
 
   for (const auto& [GUIDString, Device] : _ActiveDevices) { // For each device
-    // TODO: Stop Effects?
-    if (FAILED(hr = Device->Unacquire())) { return hr; }
+    Device->Unacquire(); // Best-effort, don't bail on failure
   }
 
+  for (auto& di : _DeviceInstances) {
+    delete[] di.guidInstance;
+    delete[] di.guidProduct;
+    delete[] di.instanceName;
+    delete[] di.productName;
+  }
   _DeviceInstances.clear();
   _ActiveDevices.clear();
   _DeviceEnumeratedEffects.clear();
@@ -139,6 +143,7 @@ HRESULT StopDirectInput() {
   _ffbLastUpdate.clear();
   if (_vecExceptionHandler) { RemoveVectoredExceptionHandler(_vecExceptionHandler); _vecExceptionHandler = nullptr; }
 
+  _DirectInput->Release();
   _DirectInput = NULL;
 
   return hr;
@@ -148,6 +153,12 @@ HRESULT StopDirectInput() {
 DeviceInfo* EnumerateDevices(/*[out]*/ int& deviceCount) {
   HRESULT hr = E_FAIL;
   if (_DirectInput == NULL) { return NULL; } // If DI not ready, return nothing
+  for (auto& di : _DeviceInstances) {        // Free previous device info strings
+    delete[] di.guidInstance;
+    delete[] di.guidProduct;
+    delete[] di.instanceName;
+    delete[] di.productName;
+  }
   _DeviceInstances.clear();                  // Clear devices
 
   // First fetch all devices
@@ -434,12 +445,27 @@ HRESULT CreateFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
       break;
 
     default:
+      delete[] FFBAxes;
+      delete[] FFBDirections;
       return E_FAIL; // Unsupported Effect
   }
 
   LPDIRECTINPUTEFFECT effectControl;
-  if (FAILED(hr = SafeCreateEffect(_ActiveDevices[GUIDString], EffectTypeToGUID(effectType), &effect, &effectControl))) { return hr; }
-  if (FAILED(hr = SafeStartEffect(effectControl))) { return hr; }
+  if (FAILED(hr = SafeCreateEffect(_ActiveDevices[GUIDString], EffectTypeToGUID(effectType), &effect, &effectControl))) {
+    delete[] FFBAxes;
+    delete[] FFBDirections;
+    delete[] conditions;       // NULL if ConstantForce
+    delete constantForce;      // NULL if condition-based
+    return hr;
+  }
+  if (FAILED(hr = SafeStartEffect(effectControl))) {
+    effectControl->Release();
+    delete[] FFBAxes;
+    delete[] FFBDirections;
+    delete[] conditions;
+    delete constantForce;
+    return hr;
+  }
   _DeviceFFBEffectConfig[GUIDString][effectType]  = effect;
   _DeviceFFBEffectControl[GUIDString][effectType] = effectControl;
 
@@ -454,6 +480,19 @@ HRESULT DestroyFFBEffect(LPCSTR guidInstance, Effects::Type effectType) {
   if (!_DeviceFFBEffectControl[GUIDString].contains(effectType)) { return S_OK; } // Effect doesn't exist
 
   hr = SafeStopEffect(_DeviceFFBEffectControl[GUIDString][effectType]); // Stop Effect
+  _DeviceFFBEffectControl[GUIDString][effectType]->Release();   // Release COM object
+
+  // Free heap allocations from CreateFFBEffect
+  DIEFFECT& cfg = _DeviceFFBEffectConfig[GUIDString][effectType];
+  delete[] cfg.rgdwAxes;
+  delete[] cfg.rglDirection;
+  if (cfg.lpvTypeSpecificParams) {
+    if (effectType == Effects::Type::ConstantForce)
+      delete (DICONSTANTFORCE*)cfg.lpvTypeSpecificParams;
+    else
+      delete[] (DICONDITION*)cfg.lpvTypeSpecificParams;
+  }
+
   _DeviceFFBEffectControl[GUIDString].erase(effectType);        // Remove Effect Control
   _DeviceFFBEffectConfig[GUIDString].erase(effectType);         // Remove Effect Config
 
@@ -505,20 +544,20 @@ HRESULT StopAllFFBEffects(LPCSTR guidInstance) {
   //  //_DeviceFFBEffectConfig[GUIDString].erase(effectType);         // Remove Effect Config
   //}
 
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::ConstantForce); 
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::RampForce);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::Square);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::Sine);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::Triangle);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::SawtoothUp);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::SawtoothDown);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::Spring);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::Damper);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::Inertia);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::Friction);
-  hr = DestroyFFBEffect(guidInstance, Effects::Type::CustomForce);
+  HRESULT firstError = S_OK;
+  Effects::Type allTypes[] = {
+    Effects::Type::ConstantForce, Effects::Type::RampForce,
+    Effects::Type::Square, Effects::Type::Sine, Effects::Type::Triangle,
+    Effects::Type::SawtoothUp, Effects::Type::SawtoothDown,
+    Effects::Type::Spring, Effects::Type::Damper,
+    Effects::Type::Inertia, Effects::Type::Friction, Effects::Type::CustomForce
+  };
+  for (auto type : allTypes) {
+    HRESULT r = DestroyFFBEffect(guidInstance, type);
+    if (FAILED(r) && SUCCEEDED(firstError)) { firstError = r; }
+  }
 
-  return hr;
+  return firstError;
 }
 
 void SetDeviceChangeCallback(DeviceChangeCallback CB) {
@@ -542,14 +581,14 @@ HRESULT DEBUG1(LPCSTR guidInstance, /*[out]*/ SAFEARRAY** DebugData) {
 
   // Testing Fanatec Fix
   LPDIRECTINPUTDEVICE8 DIDevice = nullptr;
-  if (FAILED(hr = _DirectInput->CreateDevice(LPCSTRGUIDtoGUID(guidInstance), &DIDevice, NULL))) { return true; } // L"CreateDevice failed! 0x%08x", hr
+  if (FAILED(hr = _DirectInput->CreateDevice(LPCSTRGUIDtoGUID(guidInstance), &DIDevice, NULL))) { return hr; } // L"CreateDevice failed! 0x%08x", hr
 
   DIPROPGUIDANDPATH GUIDPath;
   GUIDPath.diph.dwSize = sizeof(DIPROPGUIDANDPATH);
   GUIDPath.diph.dwHeaderSize = sizeof(DIPROPHEADER);
   GUIDPath.diph.dwObj = 0;
   GUIDPath.diph.dwHow = DIPH_DEVICE;
-  if (FAILED(hr = DIDevice->GetProperty(DIPROP_GUIDANDPATH, &GUIDPath.diph))) { DIDevice->Release(); return true; } // L"GetProperty failed! Failed to get symbolic path for device 0x%08x", hr
+  if (FAILED(hr = DIDevice->GetProperty(DIPROP_GUIDANDPATH, &GUIDPath.diph))) { DIDevice->Release(); return hr; } // L"GetProperty failed! Failed to get symbolic path for device 0x%08x", hr
   DIDevice->Release();
 
   //if (wcsstr(GUIDPath.wszPath, L"&col01") != 0) { // This is our primary device (HID Path contains "&col01")
@@ -703,7 +742,9 @@ std::string wstring_to_string(const std::wstring& wstr){
 std::string GUID_to_string(GUID guidInstance) {
   OLECHAR* guidSTR;
   (void)StringFromCLSID(guidInstance, &guidSTR);
-  return wstring_to_string(guidSTR);
+  std::string result = wstring_to_string(guidSTR);
+  CoTaskMemFree(guidSTR);
+  return result;
 }
 
 // Return window handle for specified PID
@@ -752,7 +793,7 @@ FlatJoyState2 FlattenDIJOYSTATE2(DIJOYSTATE2 DeviceState) {
   // ButtonB
   for (int i = 64; i < 128; i++) { // 2nd bank of buttons from 64-128
     if (DeviceState.rgbButtons[i] == 128) // 128 = Button pressed
-      state.buttonsB |= (unsigned long long)1 << i; // Shift in a 1 to the button at index i
+      state.buttonsB |= (unsigned long long)1 << (i - 64); // Shift in a 1 to the button at index (i-64)
   }
 
   state.lX = DeviceState.lX; // X-axis
