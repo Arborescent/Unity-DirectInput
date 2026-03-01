@@ -454,12 +454,14 @@ HRESULT UpdateFFBEffect(LPCSTR guidInstance, Effects::Type effectType, DICONDITI
     }
     default:
       for (DWORD idx = 0; idx < _DeviceFFBEffectConfig[GUIDString][effectType].cAxes; idx++) { // For each Axis in this effect
-        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lOffset = conditions[idx].lOffset;
-        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lPositiveCoefficient = conditions[idx].lPositiveCoefficient;
-        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lNegativeCoefficient = conditions[idx].lNegativeCoefficient;
-        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].dwPositiveSaturation = conditions[idx].dwPositiveSaturation;
-        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].dwNegativeSaturation = conditions[idx].dwNegativeSaturation;
-        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lDeadBand = conditions[idx].lDeadBand;
+        // Always read from conditions[0] — the C# Simple functions pass a 1-element array,
+        // and we have no way to know the array length from a raw pointer.
+        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lOffset = conditions[0].lOffset;
+        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lPositiveCoefficient = conditions[0].lPositiveCoefficient;
+        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lNegativeCoefficient = conditions[0].lNegativeCoefficient;
+        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].dwPositiveSaturation = conditions[0].dwPositiveSaturation;
+        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].dwNegativeSaturation = conditions[0].dwNegativeSaturation;
+        ((DICONDITION*)_DeviceFFBEffectConfig[GUIDString][effectType].lpvTypeSpecificParams)[idx].lDeadBand = conditions[0].lDeadBand;
       }
       break;
   }
